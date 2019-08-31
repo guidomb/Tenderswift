@@ -78,35 +78,37 @@ class TendermintSocketProtocolHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
     
     private var messageDataBuffer = Data()
+    private var uuid = UUID()
     
     func channelRegistered(context: ChannelHandlerContext) {
-        print("New inboud TendermintSocketProtocolHandler channel registered")
+        log("New inboud TendermintSocketProtocolHandler channel registered")
     }
     
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var byteBuffer = unwrapInboundIn(data)
         guard byteBuffer.readableBytes > 0 else {
-            print("WARN: data read from channel is empty")
+            log("WARN: data read from channel is empty")
             return
         }
         
         
         guard let messageSize = byteBuffer.readVarint() else {
-            print("Ignoring inbound read. Message size could not be read.")
+            log("Ignoring inbound read. Message size could not be read.")
             return
         }
-        print("Message size: \(messageSize)")
-        print("Byte buffer size: \(byteBuffer.readableBytes)")
-        print("Message data buffer size: \(messageDataBuffer.count)")
+        
+        log("Message size: \(messageSize)")
+        log("Byte buffer size: \(byteBuffer.readableBytes)")
+        log("Message data buffer size: \(messageDataBuffer.count)")
         
         guard byteBuffer.readData(into: &messageDataBuffer) else {
-            print("Ignoring inbound read. Message data could not be read.")
+            log("Ignoring inbound read. Message data could not be read.")
             return
         }
         
         guard messageDataBuffer.count > messageSize else {
             let remainingBytes = messageSize - messageDataBuffer.count
-            print("Request data appended. \(remainingBytes) remaining bytes.")
+            log("Request data appended. \(remainingBytes) remaining bytes.")
             return
         }
         
@@ -114,15 +116,20 @@ class TendermintSocketProtocolHandler: ChannelInboundHandler {
             let request = try Request(serializedData: messageDataBuffer)
             handleRequest(request)
         } catch let error {
-            print("Error - Request data could not parsed. \(error)")
+            log("Error - Request data could not parsed. \(error)")
         }
         
+        log("Remaining bytes \(byteBuffer.readableBytes)")
         messageDataBuffer = Data(capacity: byteBuffer.readableBytes)
         if byteBuffer.readableBytes > 0 && !byteBuffer.readData(into: &messageDataBuffer) {
-            print("Error - Remaining data could not be read")
+            log("Error - Remaining data could not be read")
         }
     }
-        
+      
+    func log(_ message: String) {
+        print("\(uuid) - \(message)")
+    }
+    
 }
 
 
@@ -175,6 +182,7 @@ let serverBootstrap = ServerBootstrap(group: eventLoopGroup)
     }
 
 do {
+    print("Accepting connections from '\(unixSocketPath)' ...")
     let channel = try serverBootstrap.bind(unixDomainSocketPath: unixSocketPath).wait()
     _ = try channel.closeFuture.wait()
 } catch let error {
