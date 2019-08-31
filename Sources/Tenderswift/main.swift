@@ -1,6 +1,7 @@
 import NIO
 import TendermintCore
 import Foundation
+import SwiftProtobuf
 
 class PrintHandler: ChannelInboundHandler {
     
@@ -29,20 +30,54 @@ extension ByteBuffer {
 
     }
     
+    mutating func readData(into data: inout Data) -> Bool {
+        guard let bytes = self.readBytes(length: self.readableBytes) else {
+            return false
+        }
+        
+        data.append(contentsOf: bytes)
+        return true
+    }
+    
+    mutating func readData(length: Int) -> Data? {
+        if length < self.readableBytes {
+            return self.readBytes(length: length)
+                .map { Data(bytes: $0, count: length) }
+        } else {
+            return self.readData()
+        }
+    }
+    
+    mutating func readVarint() -> Int? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        let initialReadIndex = self.readerIndex
+
+        while true {
+            guard let c: UInt8 = self.readInteger() else {
+                // ran out of bytes. Reset the read pointer and return nil.
+                self.moveReaderIndex(to: initialReadIndex)
+                return nil
+            }
+
+            value |= UInt64(c & 0x7F) << shift
+            if c & 0x80 == 0 {
+                return Int(value)
+            }
+            shift += 7
+            if shift > 63 {
+                fatalError("Invalid varint, requires shift (\(shift)) > 64")
+            }
+        }
+    }
+    
 }
 
 class TendermintSocketProtocolHandler: ChannelInboundHandler {
     
-    enum State {
-        
-        case idle
-        case waitingForMessageData(remainingLength: UInt64, data: Data)
-        
-    }
-    
     typealias InboundIn = ByteBuffer
     
-    private var state: State = .idle
+    private var messageDataBuffer = Data()
     
     func channelRegistered(context: ChannelHandlerContext) {
         print("New inboud TendermintSocketProtocolHandler channel registered")
@@ -55,57 +90,77 @@ class TendermintSocketProtocolHandler: ChannelInboundHandler {
             return
         }
         
-        switch state {
-        case .idle:
-            guard let encodedLengthSize = byteBuffer.readInteger(endianness: .big, as: Int.self) else {
-                fatalError("byteBuffer is empty but it should not be empty")
-            }
-            
-            guard byteBuffer.readableBytes >= encodedLengthSize else {
-                fatalError("Unable to read encoded message length size. ByteBuffer is too small")
-            }
-         
-            if encodedLengthSize > 8 {
-                fatalError("Message too long")
-            } else {
-                guard let bytes = byteBuffer.readBytes(length: encodedLengthSize) else {
-                    fatalError("ERROR: Unable to read byte buffer")
-                }
-                let messageLength = Data(bytes: bytes, count: bytes.count).withUnsafeBytes {
-                    $0.load(as: UInt64.self)
-                }
-                guard let data = byteBuffer.readData() else {
-                    fatalError("Unable to read message data")
-                }
-                
-                if data.count < messageLength {
-                    state = .waitingForMessageData(remainingLength: messageLength - UInt64(data.count), data: data)
-                } else {
-                    // TODO desearilize
-                }
-            }
-            
-            
-        case .waitingForMessageData(let remainingLength, let previousData):
-            guard byteBuffer.readableBytes <= remainingLength else {
-                fatalError("TODO cannot handle packets with two messages")
-            }
-            guard let data = byteBuffer.readData() else {
-                fatalError("Unable to read message data while waitingForMessageData")
-            }
-            
-            if data.count < remainingLength {
-                var accum = Data(capacity: previousData.count + data.count)
-                accum.append(previousData)
-                accum.append(data)
-                state = .waitingForMessageData(remainingLength: remainingLength - UInt64(data.count), data: accum)
-            } else {
-                // TODO desearilize
-            }
+        
+        guard let messageSize = byteBuffer.readVarint() else {
+            print("Ignoring inbound read. Message size could not be read.")
+            return
+        }
+        print("Message size: \(messageSize)")
+        print("Byte buffer size: \(byteBuffer.readableBytes)")
+        print("Message data buffer size: \(messageDataBuffer.count)")
+        
+        guard byteBuffer.readData(into: &messageDataBuffer) else {
+            print("Ignoring inbound read. Message data could not be read.")
+            return
+        }
+        
+        guard messageDataBuffer.count > messageSize else {
+            let remainingBytes = messageSize - messageDataBuffer.count
+            print("Request data appended. \(remainingBytes) remaining bytes.")
+            return
+        }
+        
+        do {
+            let request = try Request(serializedData: messageDataBuffer)
+            handleRequest(request)
+        } catch let error {
+            print("Error - Request data could not parsed. \(error)")
+        }
+        
+        messageDataBuffer = Data(capacity: byteBuffer.readableBytes)
+        if byteBuffer.readableBytes > 0 && !byteBuffer.readData(into: &messageDataBuffer) {
+            print("Error - Remaining data could not be read")
         }
     }
-    
+        
 }
+
+
+func handleRequest(_ request: Request) {
+    guard let value = request.value else {
+        print("Ignoring inbound request. Request has no value.")
+        return
+    }
+    
+    print("Handling request \(request)")
+    switch value {
+    case .echo(_):
+        return
+    case .flush(_):
+        return
+    case .info(_):
+        return
+    case .setOption(_):
+        return
+    case .initChain(_):
+        return
+    case .query(_):
+        return
+    case .beginBlock(_):
+        return
+    case .checkTx(_):
+        return
+    case .deliverTx(_):
+        return
+    case .endBlock(_):
+        return
+    case .commit(_):
+        return
+    }
+}
+
+
+
 
 if CommandLine.argc < 2 {
     fatalError("You need to pass a UNIX socket path")
@@ -115,7 +170,7 @@ let unixSocketPath = CommandLine.arguments[1]
 let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 let serverBootstrap = ServerBootstrap(group: eventLoopGroup)
     .childChannelInitializer { channel in
-        channel.pipeline.addHandler(BackPressureHandler(), name: "BackPressureHandler").flatMap { _ in channel.pipeline.addHandler(PrintHandler(), name: "EchoHandler")
+        channel.pipeline.addHandler(BackPressureHandler(), name: "BackPressureHandler").flatMap { _ in channel.pipeline.addHandler(TendermintSocketProtocolHandler(), name: "TendermintSocketProtocolHandler")
         }
     }
 
@@ -125,4 +180,3 @@ do {
 } catch let error {
     print("Error while waiting on socket '\(unixSocketPath)': \(error)")
 }
-
